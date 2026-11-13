@@ -15,6 +15,1346 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Create project files
+        run: |
+          mkdir -p app/src/main/java/com/chessassist
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "ChessAssist"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.chessassist"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.chessassist"
+                  minSdk = 30
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "0.1"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="ChessAssist"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".CaptureService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/chessassist/Chess.kt <<'EOF'
+          package com.chessassist
+
+          import kotlin.math.abs
+
+          const val PAWN = 1
+          const val KNIGHT = 2
+          const val BISHOP = 3
+          const val ROOK = 4
+          const val QUEEN = 5
+          const val KING = 6
+
+          fun moveFrom(m: Int) = m and 63
+          fun moveTo(m: Int) = (m shr 6) and 63
+          fun movePromo(m: Int) = (m shr 12) and 15
+          fun sqName(i: Int) = "${'a' + i % 8}${i / 8 + 1}"
+          fun moveText(m: Int): String {
+              val promo = movePromo(m)
+              val suffix = if (promo != 0) "=" + "?PNBRQK"[promo] else ""
+              return sqName(moveFrom(m)) + " → " + sqName(moveTo(m)) + suffix
+          }
+
+          class MoveList {
+              val a = IntArray(320)
+              var n = 0
+              fun add(m: Int) {
+                  a[n++] = m
+              }
+          }
+
+          class Position(val b: IntArray, val side: Int, val castling: Int, val ep: Int)
+
+          object Rules {
+              private val KN = arrayOf(
+                  intArrayOf(1, 2), intArrayOf(2, 1), intArrayOf(-1, 2), intArrayOf(-2, 1),
+                  intArrayOf(1, -2), intArrayOf(2, -1), intArrayOf(-1, -2), intArrayOf(-2, -1)
+              )
+              private val DIAG = arrayOf(intArrayOf(1, 1), intArrayOf(1, -1), intArrayOf(-1, 1), intArrayOf(-1, -1))
+              private val ORTH = arrayOf(intArrayOf(1, 0), intArrayOf(-1, 0), intArrayOf(0, 1), intArrayOf(0, -1))
+
+              fun initial(): Position {
+                  val b = IntArray(64)
+                  val back = intArrayOf(ROOK, KNIGHT, BISHOP, QUEEN, KING, BISHOP, KNIGHT, ROOK)
+                  for (f in 0..7) {
+                      b[f] = back[f]
+                      b[8 + f] = PAWN
+                      b[48 + f] = -PAWN
+                      b[56 + f] = -back[f]
+                  }
+                  return Position(b, 1, 15, -1)
+              }
+
+              fun attacked(b: IntArray, sq: Int, by: Int): Boolean {
+                  val r = sq / 8
+                  val f = sq % 8
+                  val pr = r - by
+                  if (pr in 0..7) {
+                      for (k in 0..1) {
+                          val pf = f + 2 * k - 1
+                          if (pf in 0..7 && b[pr * 8 + pf] == by * PAWN) return true
+                      }
+                  }
+                  for (d in KN) {
+                      val rr = r + d[0]
+                      val ff = f + d[1]
+                      if (rr in 0..7 && ff in 0..7 && b[rr * 8 + ff] == by * KNIGHT) return true
+                  }
+                  for (dr in -1..1) {
+                      for (df in -1..1) {
+                          if (dr == 0 && df == 0) continue
+                          val rr = r + dr
+                          val ff = f + df
+                          if (rr in 0..7 && ff in 0..7 && b[rr * 8 + ff] == by * KING) return true
+                      }
+                  }
+                  for (d in DIAG) {
+                      var rr = r + d[0]
+                      var ff = f + d[1]
+                      while (rr in 0..7 && ff in 0..7) {
+                          val p = b[rr * 8 + ff]
+                          if (p != 0) {
+                              if (p == by * BISHOP || p == by * QUEEN) return true
+                              break
+                          }
+                          rr += d[0]
+                          ff += d[1]
+                      }
+                  }
+                  for (d in ORTH) {
+                      var rr = r + d[0]
+                      var ff = f + d[1]
+                      while (rr in 0..7 && ff in 0..7) {
+                          val p = b[rr * 8 + ff]
+                          if (p != 0) {
+                              if (p == by * ROOK || p == by * QUEEN) return true
+                              break
+                          }
+                          rr += d[0]
+                          ff += d[1]
+                      }
+                  }
+                  return false
+              }
+
+              private fun kingSquare(b: IntArray, side: Int): Int {
+                  for (i in 0..63) if (b[i] == side * KING) return i
+                  return -1
+              }
+
+              fun inCheck(pos: Position): Boolean {
+                  val k = kingSquare(pos.b, pos.side)
+                  return k >= 0 && attacked(pos.b, k, -pos.side)
+              }
+
+              private fun addPawn(out: MoveList, from: Int, to: Int, promote: Boolean) {
+                  if (promote) {
+                      out.add(from or (to shl 6) or (QUEEN shl 12))
+                      out.add(from or (to shl 6) or (ROOK shl 12))
+                      out.add(from or (to shl 6) or (BISHOP shl 12))
+                      out.add(from or (to shl 6) or (KNIGHT shl 12))
+                  } else {
+                      out.add(from or (to shl 6))
+                  }
+              }
+
+              private fun slide(b: IntArray, sq: Int, dirs: Array<IntArray>, side: Int, out: MoveList) {
+                  val r = sq / 8
+                  val f = sq % 8
+                  for (d in dirs) {
+                      var rr = r + d[0]
+                      var ff = f + d[1]
+                      while (rr in 0..7 && ff in 0..7) {
+                          val t = rr * 8 + ff
+                          val q = b[t]
+                          if (q * side > 0) break
+                          out.add(sq or (t shl 6))
+                          if (q != 0) break
+                          rr += d[0]
+                          ff += d[1]
+                      }
+                  }
+              }
+
+              fun pseudo(pos: Position, out: MoveList) {
+                  val b = pos.b
+                  val side = pos.side
+                  for (sq in 0..63) {
+                      val p = b[sq]
+                      if (p * side <= 0) continue
+                      val r = sq / 8
+                      val f = sq % 8
+                      when (abs(p)) {
+                          PAWN -> {
+                              val nr = r + side
+                              if (nr in 0..7) {
+                                  val last = if (side == 1) 7 else 0
+                                  val start = if (side == 1) 1 else 6
+                                  val t = nr * 8 + f
+                                  if (b[t] == 0) {
+                                      addPawn(out, sq, t, nr == last)
+                                      val t2 = (r + 2 * side) * 8 + f
+                                      if (r == start && b[t2] == 0) out.add(sq or (t2 shl 6))
+                                  }
+                                  for (k in 0..1) {
+                                      val nf = f + 2 * k - 1
+                                      if (nf !in 0..7) continue
+                                      val tc = nr * 8 + nf
+                                      if (b[tc] * side < 0) {
+                                          addPawn(out, sq, tc, nr == last)
+                                      } else if (tc == pos.ep && b[tc] == 0) {
+                                          out.add(sq or (tc shl 6))
+                                      }
+                                  }
+                              }
+                          }
+                          KNIGHT -> {
+                              for (d in KN) {
+                                  val rr = r + d[0]
+                                  val ff = f + d[1]
+                                  if (rr !in 0..7 || ff !in 0..7) continue
+                                  val t = rr * 8 + ff
+                                  if (b[t] * side <= 0) out.add(sq or (t shl 6))
+                              }
+                          }
+                          BISHOP -> slide(b, sq, DIAG, side, out)
+                          ROOK -> slide(b, sq, ORTH, side, out)
+                          QUEEN -> {
+                              slide(b, sq, DIAG, side, out)
+                              slide(b, sq, ORTH, side, out)
+                          }
+                          KING -> {
+                              for (dr in -1..1) {
+                                  for (df in -1..1) {
+                                      if (dr == 0 && df == 0) continue
+                                      val rr = r + dr
+                                      val ff = f + df
+                                      if (rr !in 0..7 || ff !in 0..7) continue
+                                      val t = rr * 8 + ff
+                                      if (b[t] * side <= 0) out.add(sq or (t shl 6))
+                                  }
+                              }
+                              val base = if (side == 1) 0 else 56
+                              if (sq == base + 4) {
+                                  val ksBit = if (side == 1) 1 else 4
+                                  val qsBit = if (side == 1) 2 else 8
+                                  val enemy = -side
+                                  if ((pos.castling and ksBit) != 0 &&
+                                      b[base + 5] == 0 && b[base + 6] == 0 && b[base + 7] == side * ROOK &&
+                                      !attacked(b, base + 4, enemy) && !attacked(b, base + 5, enemy) && !attacked(b, base + 6, enemy)
+                                  ) out.add(sq or ((base + 6) shl 6))
+                                  if ((pos.castling and qsBit) != 0 &&
+                                      b[base + 1] == 0 && b[base + 2] == 0 && b[base + 3] == 0 && b[base] == side * ROOK &&
+                                      !attacked(b, base + 4, enemy) && !attacked(b, base + 3, enemy) && !attacked(b, base + 2, enemy)
+                                  ) out.add(sq or ((base + 2) shl 6))
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private fun crMask(sq: Int): Int = when (sq) {
+                  0 -> 2.inv()
+                  7 -> 1.inv()
+                  56 -> 8.inv()
+                  63 -> 4.inv()
+                  4 -> 3.inv()
+                  60 -> 12.inv()
+                  else -> -1
+              }
+
+              fun make(pos: Position, m: Int): Position {
+                  val b = pos.b.copyOf()
+                  val from = moveFrom(m)
+                  val to = moveTo(m)
+                  val promo = movePromo(m)
+                  val p = b[from]
+                  val side = pos.side
+                  val type = abs(p)
+                  var ep = -1
+                  if (type == PAWN && to == pos.ep && b[to] == 0 && from % 8 != to % 8) b[to - 8 * side] = 0
+                  if (type == KING && abs(to - from) == 2) {
+                      if (to > from) {
+                          b[from + 1] = b[from + 3]
+                          b[from + 3] = 0
+                      } else {
+                          b[from - 1] = b[from - 4]
+                          b[from - 4] = 0
+                      }
+                  }
+                  if (type == PAWN && abs(to - from) == 16) ep = (from + to) / 2
+                  b[to] = if (promo != 0) side * promo else p
+                  b[from] = 0
+                  val castling = pos.castling and crMask(from) and crMask(to)
+                  return Position(b, -side, castling, ep)
+              }
+
+              fun legal(pos: Position): MoveList {
+                  val tmp = MoveList()
+                  pseudo(pos, tmp)
+                  val out = MoveList()
+                  for (i in 0 until tmp.n) {
+                      val m = tmp.a[i]
+                      val q = make(pos, m)
+                      val k = kingSquare(q.b, pos.side)
+                      if (k >= 0 && !attacked(q.b, k, -pos.side)) out.add(m)
+                  }
+                  return out
+              }
+
+              fun match(pos: Position, obs: IntArray): List<Int>? {
+                  val l1 = legal(pos)
+                  for (i in 0 until l1.n) {
+                      val q = make(pos, l1.a[i])
+                      if (q.b.contentEquals(obs)) return listOf(l1.a[i])
+                  }
+                  for (i in 0 until l1.n) {
+                      val q = make(pos, l1.a[i])
+                      val l2 = legal(q)
+                      for (j in 0 until l2.n) {
+                          val r = make(q, l2.a[j])
+                          if (r.b.contentEquals(obs)) return listOf(l1.a[i], l2.a[j])
+                      }
+                  }
+                  return null
+              }
+          }
+
+          class Engine {
+              @Volatile
+              private var stop = false
+              private var deadline = 0L
+              private var nodes = 0L
+
+              fun abort() {
+                  stop = true
+              }
+
+              fun best(pos: Position, millis: Long, maxDepth: Int = 7): Int? {
+                  val root = Rules.legal(pos)
+                  if (root.n == 0) return null
+                  var best = root.a[0]
+                  stop = false
+                  nodes = 0
+                  deadline = System.currentTimeMillis() + millis
+                  for (d in 1..maxDepth) {
+                      val ms = order(pos, root, best)
+                      var alpha = -INF
+                      var bestThis = -1
+                      var aborted = false
+                      for (m in ms) {
+                          val s = -negamax(Rules.make(pos, m), d - 1, -INF, -alpha, 1)
+                          if (stop) {
+                              aborted = true
+                              break
+                          }
+                          if (bestThis == -1 || s > alpha) {
+                              alpha = s
+                              bestThis = m
+                          }
+                      }
+                      if (aborted || bestThis == -1) break
+                      best = bestThis
+                      if (alpha > MATE - 100) break
+                      if (System.currentTimeMillis() > deadline) break
+                  }
+                  return best
+              }
+
+              private fun timeCheck() {
+                  if ((++nodes and 1023L) == 0L && System.currentTimeMillis() > deadline) stop = true
+              }
+
+              private fun negamax(pos: Position, depth: Int, alphaIn: Int, beta: Int, ply: Int): Int {
+                  timeCheck()
+                  if (stop) return 0
+                  val inChk = Rules.inCheck(pos)
+                  val d = if (inChk && ply < 10) depth + 1 else depth
+                  if (d <= 0) return quiesce(pos, alphaIn, beta, ply)
+                  val ml = Rules.legal(pos)
+                  if (ml.n == 0) return if (inChk) -MATE + ply else 0
+                  var alpha = alphaIn
+                  var best = -INF
+                  for (m in order(pos, ml, 0)) {
+                      val s = -negamax(Rules.make(pos, m), d - 1, -beta, -alpha, ply + 1)
+                      if (stop) return 0
+                      if (s > best) best = s
+                      if (s > alpha) alpha = s
+                      if (alpha >= beta) break
+                  }
+                  return best
+              }
+
+              private fun quiesce(pos: Position, alphaIn: Int, beta: Int, ply: Int): Int {
+                  timeCheck()
+                  if (stop) return 0
+                  val stand = evaluate(pos)
+                  if (ply > 24 || stand >= beta) return stand
+                  var alpha = alphaIn
+                  if (stand > alpha) alpha = stand
+                  val ml = Rules.legal(pos)
+                  for (m in order(pos, ml, 0)) {
+                      if (pos.b[moveTo(m)] == 0 && movePromo(m) == 0) continue
+                      val s = -quiesce(Rules.make(pos, m), -beta, -alpha, ply + 1)
+                      if (stop) return 0
+                      if (s >= beta) return s
+                      if (s > alpha) alpha = s
+                  }
+                  return alpha
+              }
+
+              private fun order(pos: Position, ml: MoveList, first: Int): IntArray {
+                  val n = ml.n
+                  val ms = ml.a.copyOf(n)
+                  val sc = IntArray(n)
+                  for (i in 0 until n) {
+                      val m = ms[i]
+                      var s = 0
+                      val victim = abs(pos.b[moveTo(m)])
+                      if (victim != 0) s += 1000 + 10 * victim - abs(pos.b[moveFrom(m)])
+                      if (movePromo(m) != 0) s += 900
+                      if (m == first) s += 100000
+                      sc[i] = s
+                  }
+                  for (i in 1 until n) {
+                      val m = ms[i]
+                      val s = sc[i]
+                      var j = i - 1
+                      while (j >= 0 && sc[j] < s) {
+                          ms[j + 1] = ms[j]
+                          sc[j + 1] = sc[j]
+                          j--
+                      }
+                      ms[j + 1] = m
+                      sc[j + 1] = s
+                  }
+                  return ms
+              }
+
+              private fun evaluate(pos: Position): Int {
+                  var s = 0
+                  val b = pos.b
+                  for (sq in 0..63) {
+                      val p = b[sq]
+                      if (p == 0) continue
+                      val t = abs(p)
+                      val r = sq / 8
+                      val f = sq % 8
+                      val idx = if (p > 0) (7 - r) * 8 + f else r * 8 + f
+                      val v = VAL[t] + pst(t, idx)
+                      s += if (p > 0) v else -v
+                  }
+                  return s * pos.side
+              }
+
+              private fun pst(t: Int, idx: Int): Int = when (t) {
+                  PAWN -> PST_P[idx]
+                  KNIGHT -> PST_N[idx]
+                  BISHOP -> PST_B[idx]
+                  KING -> PST_K[idx]
+                  else -> 0
+              }
+
+              companion object {
+                  const val MATE = 30000
+                  const val INF = 32000
+                  private val VAL = intArrayOf(0, 100, 320, 330, 500, 900, 0)
+
+                  private val PST_P = intArrayOf(
+                      0, 0, 0, 0, 0, 0, 0, 0,
+                      50, 50, 50, 50, 50, 50, 50, 50,
+                      10, 10, 20, 30, 30, 20, 10, 10,
+                      5, 5, 10, 25, 25, 10, 5, 5,
+                      0, 0, 0, 20, 20, 0, 0, 0,
+                      5, -5, -10, 0, 0, -10, -5, 5,
+                      5, 10, 10, -20, -20, 10, 10, 5,
+                      0, 0, 0, 0, 0, 0, 0, 0
+                  )
+                  private val PST_N = intArrayOf(
+                      -50, -40, -30, -30, -30, -30, -40, -50,
+                      -40, -20, 0, 0, 0, 0, -20, -40,
+                      -30, 0, 10, 15, 15, 10, 0, -30,
+                      -30, 5, 15, 20, 20, 15, 5, -30,
+                      -30, 0, 15, 20, 20, 15, 0, -30,
+                      -30, 5, 10, 15, 15, 10, 5, -30,
+                      -40, -20, 0, 5, 5, 0, -20, -40,
+                      -50, -40, -30, -30, -30, -30, -40, -50
+                  )
+                  private val PST_B = intArrayOf(
+                      -20, -10, -10, -10, -10, -10, -10, -20,
+                      -10, 0, 0, 0, 0, 0, 0, -10,
+                      -10, 0, 5, 10, 10, 5, 0, -10,
+                      -10, 5, 5, 10, 10, 5, 5, -10,
+                      -10, 0, 10, 10, 10, 10, 0, -10,
+                      -10, 10, 10, 10, 10, 10, 10, -10,
+                      -10, 5, 0, 0, 0, 0, 5, -10,
+                      -20, -10, -10, -10, -10, -10, -10, -20
+                  )
+                  private val PST_K = intArrayOf(
+                      -30, -40, -40, -50, -50, -40, -40, -30,
+                      -30, -40, -40, -50, -50, -40, -40, -30,
+                      -30, -40, -40, -50, -50, -40, -40, -30,
+                      -30, -40, -40, -50, -50, -40, -40, -30,
+                      -20, -30, -30, -40, -40, -30, -30, -20,
+                      -10, -20, -20, -20, -20, -20, -20, -10,
+                      20, 20, 0, 0, 0, 0, 20, 20,
+                      20, 30, 10, 0, 0, 10, 30, 20
+                  )
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/chessassist/Vision.kt <<'EOF'
+          package com.chessassist
+
+          import kotlin.math.abs
+          import kotlin.math.max
+          import kotlin.math.min
+
+          class FrameBuf {
+              var data = ByteArray(0)
+              var w = 0
+              var h = 0
+              var stride = 0
+              var seq = 0L
+              var valid = false
+          }
+
+          class Geometry(val x0: Float, val y0: Float, val side: Float) {
+              val sq: Float get() = side / 8f
+          }
+
+          class Templates {
+              val feats = ArrayList<IntArray>()
+              val codes = ArrayList<Int>()
+          }
+
+          object Vision {
+              const val G = 16
+              private const val THR = 22
+              private const val EMPTY_CELLS = 24
+              private const val MAX_DIST = 90
+              private const val MAX_SELF_DIST = 120
+
+              private fun rgb(f: FrameBuf, x: Int, y: Int): Int {
+                  val xx = x.coerceIn(0, f.w - 1)
+                  val yy = y.coerceIn(0, f.h - 1)
+                  val i = yy * f.stride + xx * 4
+                  return ((f.data[i].toInt() and 255) shl 16) or
+                      ((f.data[i + 1].toInt() and 255) shl 8) or
+                      (f.data[i + 2].toInt() and 255)
+              }
+
+              private fun med4(a: Int, b: Int, c: Int, d: Int): Int =
+                  (a + b + c + d - min(min(a, b), min(c, d)) - max(max(a, b), max(c, d))) / 2
+
+              fun isBlack(f: FrameBuf): Boolean {
+                  if (!f.valid) return false
+                  for (i in 1..12) {
+                      for (j in 1..24) {
+                          if (rgb(f, f.w * i / 13, f.h * j / 25) != 0) return false
+                      }
+                  }
+                  return true
+              }
+
+              fun feature(f: FrameBuf, gx: Float, gy: Float, s: Float): IntArray {
+                  val ins = 0.12f
+                  val c0 = rgb(f, (gx + s * ins).toInt(), (gy + s * ins).toInt())
+                  val c1 = rgb(f, (gx + s * (1 - ins)).toInt(), (gy + s * ins).toInt())
+                  val c2 = rgb(f, (gx + s * ins).toInt(), (gy + s * (1 - ins)).toInt())
+                  val c3 = rgb(f, (gx + s * (1 - ins)).toInt(), (gy + s * (1 - ins)).toInt())
+                  val bgR = med4((c0 shr 16) and 255, (c1 shr 16) and 255, (c2 shr 16) and 255, (c3 shr 16) and 255)
+                  val bgG = med4((c0 shr 8) and 255, (c1 shr 8) and 255, (c2 shr 8) and 255, (c3 shr 8) and 255)
+                  val bgB = med4(c0 and 255, c1 and 255, c2 and 255, c3 and 255)
+                  val out = IntArray(G * G)
+                  for (cy in 0 until G) {
+                      for (cx in 0 until G) {
+                          var sr = 0
+                          var sg = 0
+                          var sb = 0
+                          for (sy in 0..1) {
+                              for (sx in 0..1) {
+                                  val u = 0.10f + 0.80f * ((cx + 0.25f + 0.5f * sx) / G)
+                                  val v = 0.10f + 0.80f * ((cy + 0.25f + 0.5f * sy) / G)
+                                  val c = rgb(f, (gx + s * u).toInt(), (gy + s * v).toInt())
+                                  sr += (c shr 16) and 255
+                                  sg += (c shr 8) and 255
+                                  sb += c and 255
+                              }
+                          }
+                          sr /= 4
+                          sg /= 4
+                          sb /= 4
+                          val d = max(abs(sr - bgR), max(abs(sg - bgG), abs(sb - bgB)))
+                          out[cy * G + cx] = if (d <= THR) {
+                              0
+                          } else {
+                              val lum = (299 * sr + 587 * sg + 114 * sb) / 1000
+                              if (lum >= 128) 2 else 1
+                          }
+                      }
+                  }
+                  return out
+              }
+
+              private fun dist(a: IntArray, b: IntArray): Int {
+                  var d = 0
+                  for (i in a.indices) if (a[i] != b[i]) d++
+                  return d
+              }
+
+              fun boardIndex(r: Int, c: Int, flipped: Boolean): Int {
+                  val rank = if (!flipped) 7 - r else r
+                  val file = if (!flipped) c else 7 - c
+                  return rank * 8 + file
+              }
+
+              private fun classify(feat: IntArray, t: Templates): Int? {
+                  var cover = 0
+                  for (v in feat) if (v != 0) cover++
+                  if (cover < EMPTY_CELLS) return 0
+                  var best = Int.MAX_VALUE
+                  var code = 0
+                  for (i in t.feats.indices) {
+                      val d = dist(feat, t.feats[i])
+                      if (d < best) {
+                          best = d
+                          code = t.codes[i]
+                      }
+                  }
+                  return if (best <= MAX_DIST) code else null
+              }
+
+              fun observe(f: FrameBuf, g: Geometry, flipped: Boolean, t: Templates): IntArray? {
+                  val out = IntArray(64)
+                  for (r in 0..7) {
+                      for (c in 0..7) {
+                          val feat = feature(f, g.x0 + c * g.sq, g.y0 + r * g.sq, g.sq)
+                          val code = classify(feat, t) ?: return null
+                          out[boardIndex(r, c, flipped)] = code
+                      }
+                  }
+                  return out
+              }
+
+              fun learn(f: FrameBuf, g: Geometry, flipped: Boolean): Pair<Templates?, String?> {
+                  val init = Rules.initial().b
+                  val t = Templates()
+                  for (r in 0..7) {
+                      for (c in 0..7) {
+                          val idx = boardIndex(r, c, flipped)
+                          val code = init[idx]
+                          val feat = feature(f, g.x0 + c * g.sq, g.y0 + r * g.sq, g.sq)
+                          var cover = 0
+                          for (v in feat) if (v != 0) cover++
+                          if (code == 0) {
+                              if (cover >= EMPTY_CELLS) {
+                                  return Pair(null, "Casa ${sqName(idx)} deveria estar vazia, mas tem conteúdo. Cantos mal marcados, ou o tabuleiro não está na posição inicial.")
+                              }
+                          } else {
+                              if (cover < EMPTY_CELLS) {
+                                  return Pair(null, "Não vi peça em ${sqName(idx)}. Cantos mal marcados, ou lado errado (Brancas/Pretas).")
+                              }
+                              t.feats.add(feat)
+                              t.codes.add(code)
+                          }
+                      }
+                  }
+                  for (i in t.feats.indices) {
+                      for (j in i + 1 until t.feats.size) {
+                          if (t.codes[i] == t.codes[j] && dist(t.feats[i], t.feats[j]) > MAX_SELF_DIST) {
+                              return Pair(null, "Peças iguais não parecem iguais (tema com textura ou cantos imprecisos). Refaça os cantos.")
+                          }
+                      }
+                  }
+                  return Pair(t, null)
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/chessassist/CaptureService.kt <<'EOF'
+          package com.chessassist
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.PixelFormat
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.os.IBinder
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import kotlin.math.abs
+          import kotlin.math.max
+          import kotlin.math.min
+
+          class HintView(ctx: Context) : View(ctx) {
+              var geo: Geometry? = null
+              var flipped = false
+              var from = -1
+              var to = -1
+              private val pFrom = Paint().apply {
+                  style = Paint.Style.STROKE
+                  color = Color.argb(255, 0, 230, 118)
+              }
+              private val pTo = Paint().apply {
+                  style = Paint.Style.STROKE
+                  color = Color.argb(255, 255, 23, 68)
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  val g = geo ?: return
+                  if (from < 0 || to < 0) return
+                  val loc = IntArray(2)
+                  getLocationOnScreen(loc)
+                  canvas.save()
+                  canvas.translate(-loc[0].toFloat(), -loc[1].toFloat())
+                  drawSq(canvas, g, from, pFrom)
+                  drawSq(canvas, g, to, pTo)
+                  canvas.restore()
+              }
+
+              private fun drawSq(canvas: Canvas, g: Geometry, idx: Int, paint: Paint) {
+                  val file = idx % 8
+                  val rank = idx / 8
+                  val c = if (!flipped) file else 7 - file
+                  val r = if (!flipped) 7 - rank else rank
+                  val s = g.sq
+                  val w = max(5f, s * 0.06f)
+                  paint.strokeWidth = w
+                  val l = g.x0 + c * s
+                  val t = g.y0 + r * s
+                  canvas.drawRect(l + w / 2, t + w / 2, l + s - w / 2, t + s - w / 2, paint)
+              }
+          }
+
+          class CalibView(ctx: Context, private val onDone: (Float, Float, Float, Float) -> Unit) : View(ctx) {
+              private val pts = ArrayList<Float>()
+              private val paint = Paint().apply {
+                  color = Color.WHITE
+                  textSize = 40f
+                  isAntiAlias = true
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  if (e.action == MotionEvent.ACTION_DOWN && pts.size < 4) {
+                      pts.add(e.rawX)
+                      pts.add(e.rawY)
+                      invalidate()
+                      if (pts.size == 4) onDone(pts[0], pts[1], pts[2], pts[3])
+                  }
+                  return true
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  val loc = IntArray(2)
+                  getLocationOnScreen(loc)
+                  canvas.drawColor(Color.argb(110, 0, 0, 0))
+                  val msg = when (pts.size / 2) {
+                      0 -> "Toque no canto SUPERIOR ESQUERDO do tabuleiro"
+                      1 -> "Agora toque no canto INFERIOR DIREITO do tabuleiro"
+                      else -> "Ok"
+                  }
+                  canvas.drawText(msg, 30f, 300f, paint)
+                  var i = 0
+                  while (i < pts.size) {
+                      canvas.drawCircle(pts[i] - loc[0], pts[i + 1] - loc[1], 12f, paint)
+                      i += 2
+                  }
+              }
+          }
+
+          class CaptureService : Service() {
+              private val ui = Handler(Looper.getMainLooper())
+              private lateinit var workerThread: HandlerThread
+              private lateinit var worker: Handler
+              private lateinit var wm: WindowManager
+
+              private var projection: MediaProjection? = null
+              private var display: VirtualDisplay? = null
+              private var reader: ImageReader? = null
+              private var panel: View? = null
+              private var panelParams: WindowManager.LayoutParams? = null
+              private var hintView: HintView? = null
+              private var calibView: CalibView? = null
+              private var statusView: TextView? = null
+
+              private val frame = FrameBuf()
+              private var geo: Geometry? = null
+              private var tpl: Templates? = null
+              private var flipped = false
+              private var mySide = 1
+              private var pos: Position? = null
+              private var tracking = false
+              private var lastObs: IntArray? = null
+              private var lastObsSeq = -1L
+              private var candidate: IntArray? = null
+              private var candCount = 0
+              private var unknownTicks = 0
+              private var searchGen = 0
+              private var searchEngine: Engine? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  wm = getSystemService(WindowManager::class.java)
+                  workerThread = HandlerThread("chessassist-worker")
+                  workerThread.start()
+                  worker = Handler(workerThread.looper)
+              }
+
+              @Suppress("DEPRECATION")
+              private fun readData(intent: Intent?): Intent? {
+                  if (intent == null) return null
+                  return if (Build.VERSION.SDK_INT >= 33) {
+                      intent.getParcelableExtra("data", Intent::class.java)
+                  } else {
+                      intent.getParcelableExtra("data")
+                  }
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (projection != null) return START_NOT_STICKY
+                  val code = intent?.getIntExtra("code", 0) ?: 0
+                  val data = readData(intent)
+                  if (data == null || code == 0) {
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("cap", "ChessAssist", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "cap")
+                      .setContentTitle("ChessAssist ativo")
+                      .setContentText("Lendo a tela")
+                      .setSmallIcon(android.R.drawable.ic_menu_view)
+                      .setOngoing(true)
+                      .build()
+                  startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  try {
+                      val mpm = getSystemService(MediaProjectionManager::class.java)
+                      val proj = mpm.getMediaProjection(code, data)
+                      projection = proj
+                      proj.registerCallback(object : MediaProjection.Callback() {
+                          override fun onStop() {
+                              ui.post { stopSelf() }
+                          }
+                      }, ui)
+                      val b = wm.maximumWindowMetrics.bounds
+                      val w = b.width()
+                      val h = b.height()
+                      val rd = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                      reader = rd
+                      display = proj.createVirtualDisplay(
+                          "chessassist", w, h, resources.displayMetrics.densityDpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, rd.surface, null, null
+                      )
+                      buildOverlays()
+                      worker.postDelayed({ tick() }, 500)
+                  } catch (t: Throwable) {
+                      stopSelf()
+                  }
+                  return START_NOT_STICKY
+              }
+
+              override fun onDestroy() {
+                  worker.removeCallbacksAndMessages(null)
+                  workerThread.quitSafely()
+                  searchEngine?.abort()
+                  panel?.let { runCatching { wm.removeView(it) } }
+                  hintView?.let { runCatching { wm.removeView(it) } }
+                  calibView?.let { runCatching { wm.removeView(it) } }
+                  display?.release()
+                  reader?.close()
+                  projection?.stop()
+                  super.onDestroy()
+              }
+
+              private fun overlayParams(w: Int, h: Int, touchable: Boolean): WindowManager.LayoutParams {
+                  var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                      WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                  if (!touchable) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                  val p = WindowManager.LayoutParams(w, h, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, flags, PixelFormat.TRANSLUCENT)
+                  p.gravity = Gravity.TOP or Gravity.START
+                  p.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                  return p
+              }
+
+              private fun status(s: String) {
+                  ui.post { statusView?.text = s }
+              }
+
+              private fun buildOverlays() {
+                  val dp = resources.displayMetrics.density
+                  val hv = HintView(this)
+                  hintView = hv
+                  wm.addView(hv, overlayParams(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT, false))
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(Color.argb(210, 20, 20, 20))
+                  root.setPadding((6 * dp).toInt(), (4 * dp).toInt(), (6 * dp).toInt(), (4 * dp).toInt())
+
+                  val sv = TextView(this)
+                  sv.setTextColor(Color.WHITE)
+                  sv.textSize = 12f
+                  sv.maxWidth = (320 * dp).toInt()
+                  sv.text = "Passo 1: toque em Cantos (arraste este texto para mover o painel)"
+                  statusView = sv
+                  root.addView(sv)
+
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+
+                  fun mk(label: String, act: () -> Unit): Button {
+                      val b = Button(this)
+                      b.text = label
+                      b.textSize = 11f
+                      b.isAllCaps = false
+                      b.minWidth = 0
+                      b.minimumWidth = 0
+                      b.minHeight = 0
+                      b.minimumHeight = 0
+                      b.setPadding((8 * dp).toInt(), (4 * dp).toInt(), (8 * dp).toInt(), (4 * dp).toInt())
+                      b.setOnClickListener { act() }
+                      return b
+                  }
+                  row.addView(mk("Cantos") { startCalibration() })
+                  row.addView(mk("Brancas") { worker.post { doLearn(false) } })
+                  row.addView(mk("Pretas") { worker.post { doLearn(true) } })
+                  row.addView(mk("Reset") { worker.post { doReset() } })
+                  row.addView(mk("Sair") { stopSelf() })
+                  root.addView(row)
+
+                  val lp = overlayParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, true)
+                  lp.x = 0
+                  lp.y = (40 * dp).toInt()
+                  panelParams = lp
+                  panel = root
+                  wm.addView(root, lp)
+
+                  sv.setOnTouchListener(object : View.OnTouchListener {
+                      var sx = 0f
+                      var sy = 0f
+                      var px = 0
+                      var py = 0
+                      override fun onTouch(v: View, e: MotionEvent): Boolean {
+                          val p = panelParams ?: return false
+                          when (e.action) {
+                              MotionEvent.ACTION_DOWN -> {
+                                  sx = e.rawX
+                                  sy = e.rawY
+                                  px = p.x
+                                  py = p.y
+                              }
+                              MotionEvent.ACTION_MOVE -> {
+                                  p.x = px + (e.rawX - sx).toInt()
+                                  p.y = py + (e.rawY - sy).toInt()
+                                  panel?.let { wm.updateViewLayout(it, p) }
+                              }
+                          }
+                          return true
+                      }
+                  })
+              }
+
+              private fun startCalibration() {
+                  if (calibView != null) return
+                  val cv = CalibView(this) { x1, y1, x2, y2 ->
+                      ui.post {
+                          calibView?.let { runCatching { wm.removeView(it) } }
+                          calibView = null
+                      }
+                      worker.post { setGeometry(x1, y1, x2, y2) }
+                  }
+                  calibView = cv
+                  wm.addView(cv, overlayParams(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT, true))
+              }
+
+              private fun clearHint() {
+                  ui.post {
+                      hintView?.from = -1
+                      hintView?.to = -1
+                      hintView?.invalidate()
+                  }
+              }
+
+              private fun tick() {
+                  try {
+                      grabFrame()
+                      if (tracking) processFrame()
+                  } catch (t: Throwable) {
+                      status("Erro: ${t.message}")
+                  }
+                  worker.postDelayed({ tick() }, 250)
+              }
+
+              private fun grabFrame() {
+                  val img = reader?.acquireLatestImage() ?: return
+                  try {
+                      val p = img.planes[0]
+                      val buf = p.buffer
+                      val stride = p.rowStride
+                      val need = stride * img.height
+                      if (frame.data.size != need) frame.data = ByteArray(need)
+                      buf.rewind()
+                      buf.get(frame.data, 0, min(buf.remaining(), need))
+                      frame.w = img.width
+                      frame.h = img.height
+                      frame.stride = stride
+                      frame.seq++
+                      frame.valid = true
+                  } finally {
+                      img.close()
+                  }
+              }
+
+              private fun setGeometry(x1: Float, y1: Float, x2: Float, y2: Float) {
+                  val w = abs(x2 - x1)
+                  val h = abs(y2 - y1)
+                  if (w < 200f || h < 200f) {
+                      status("Cantos muito próximos. Toque em Cantos e refaça.")
+                      return
+                  }
+                  val side = (w + h) / 2f
+                  val g = Geometry(min(x1, x2), min(y1, y2), side)
+                  geo = g
+                  tracking = false
+                  ui.post {
+                      hintView?.geo = g
+                      hintView?.invalidate()
+                  }
+                  val warn = if (abs(w - h) > side * 0.06f) " Aviso: largura e altura diferem, o tabuleiro é quadrado; refaça se errou." else ""
+                  status("Cantos ok.$warn Deixe a partida na posição inicial e toque Brancas ou Pretas (o seu lado).")
+              }
+
+              private fun doLearn(black: Boolean) {
+                  val g = geo
+                  if (g == null) {
+                      status("Marque os cantos primeiro (botão Cantos).")
+                      return
+                  }
+                  grabFrame()
+                  if (!frame.valid) {
+                      status("Ainda sem imagem da tela. Tente de novo.")
+                      return
+                  }
+                  if (Vision.isBlack(frame)) {
+                      status("Imagem preta: o Chess.com está bloqueando a captura de tela.")
+                      return
+                  }
+                  val res = Vision.learn(frame, g, black)
+                  val t = res.first
+                  if (t == null) {
+                      status(res.second ?: "Falha ao aprender as peças.")
+                      return
+                  }
+                  tpl = t
+                  flipped = black
+                  mySide = if (black) -1 else 1
+                  lastObs = null
+                  lastObsSeq = -1L
+                  candidate = null
+                  candCount = 0
+                  pos = Rules.initial()
+                  tracking = true
+                  ui.post {
+                      hintView?.flipped = black
+                      hintView?.invalidate()
+                  }
+                  onPositionChanged()
+              }
+
+              private fun doReset() {
+                  if (tpl == null) {
+                      status("Aprenda as peças primeiro (Brancas ou Pretas).")
+                      return
+                  }
+                  candidate = null
+                  candCount = 0
+                  pos = Rules.initial()
+                  tracking = true
+                  onPositionChanged()
+              }
+
+              private fun processFrame() {
+                  val g = geo ?: return
+                  val t = tpl ?: return
+                  val p = pos ?: return
+                  if (!frame.valid) return
+                  if (Vision.isBlack(frame)) {
+                      status("Imagem preta: captura bloqueada (ou o app foi minimizado).")
+                      return
+                  }
+                  var obs = lastObs
+                  if (frame.seq != lastObsSeq) {
+                      obs = Vision.observe(frame, g, flipped, t)
+                      lastObs = obs
+                      lastObsSeq = frame.seq
+                  }
+                  if (obs == null) {
+                      candidate = null
+                      candCount = 0
+                      unknownTicks++
+                      if (unknownTicks == 12) status("Não reconheço as peças (animação, tema diferente ou calibração errada).")
+                      return
+                  }
+                  unknownTicks = 0
+                  val c = candidate
+                  if (c != null && c.contentEquals(obs)) {
+                      candCount++
+                  } else {
+                      candidate = obs
+                      candCount = 1
+                  }
+                  if (candCount < 2) return
+                  if (obs.contentEquals(p.b)) return
+                  val seq = Rules.match(p, obs)
+                  if (seq == null) {
+                      if (candCount == 2 || candCount == 20) {
+                          status("Não consegui casar o lance com as regras. Em partida nova, toque Reset.")
+                      }
+                      return
+                  }
+                  var q = p
+                  for (m in seq) q = Rules.make(q, m)
+                  pos = q
+                  onPositionChanged()
+              }
+
+              private fun onPositionChanged() {
+                  val p = pos ?: return
+                  searchGen++
+                  searchEngine?.abort()
+                  clearHint()
+                  val ml = Rules.legal(p)
+                  if (ml.n == 0) {
+                      status(if (Rules.inCheck(p)) "Xeque-mate." else "Empate por afogamento.")
+                      return
+                  }
+                  if (p.side == mySide) startSearch() else status("Vez do adversário...")
+              }
+
+              private fun startSearch() {
+                  val p = pos ?: return
+                  searchEngine?.abort()
+                  val eng = Engine()
+                  searchEngine = eng
+                  val gen = ++searchGen
+                  status("Pensando...")
+                  Thread {
+                      val m = eng.best(p, 1500)
+                      worker.post { if (gen == searchGen && pos === p) showHint(m) }
+                  }.start()
+              }
+
+              private fun showHint(m: Int?) {
+                  if (m == null) {
+                      status("Sem lances legais.")
+                      return
+                  }
+                  val from = moveFrom(m)
+                  val to = moveTo(m)
+                  ui.post {
+                      hintView?.from = from
+                      hintView?.to = to
+                      hintView?.invalidate()
+                  }
+                  status("Jogue: ${moveText(m)}")
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/chessassist/MainActivity.kt <<'EOF'
+          package com.chessassist
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.media.projection.MediaProjectionConfig
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              private val reqCapture = 1001
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val dp = resources.displayMetrics.density
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding((20 * dp).toInt(), (64 * dp).toInt(), (20 * dp).toInt(), (20 * dp).toInt())
+
+                  val tv = TextView(this)
+                  tv.textSize = 16f
+                  tv.text = "ChessAssist\n\n" +
+                      "1. Toque em Ativar e aceite as permissões (sobreposição e captura de tela; escolha tela inteira).\n" +
+                      "2. Abra o Chess.com e comece uma partida. Deixe o tabuleiro na posição inicial.\n" +
+                      "3. No painel flutuante: toque Cantos, depois toque no canto superior esquerdo e no inferior direito do tabuleiro.\n" +
+                      "4. Toque Brancas ou Pretas (o seu lado) para o app aprender as peças.\n" +
+                      "5. Jogue: as casas de origem (verde) e destino (vermelho) aparecem contornadas.\n\n" +
+                      "Arraste o painel para fora do tabuleiro (segure no texto dele). Só funciona com o celular na vertical."
+                  root.addView(tv)
+
+                  val btn = Button(this)
+                  btn.text = "Ativar"
+                  btn.setOnClickListener { activate() }
+                  root.addView(btn)
+
+                  val sv = ScrollView(this)
+                  sv.addView(root)
+                  setContentView(sv)
+
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+              }
+
+              private fun activate() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, "Ative 'Exibir sobre outros apps', volte e toque Ativar de novo.", Toast.LENGTH_LONG).show()
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                      return
+                  }
+                  val mpm = getSystemService(MediaProjectionManager::class.java)
+                  val intent = if (Build.VERSION.SDK_INT >= 34) {
+                      mpm.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
+                  } else {
+                      mpm.createScreenCaptureIntent()
+                  }
+                  @Suppress("DEPRECATION")
+                  startActivityForResult(intent, reqCapture)
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == reqCapture && resultCode == RESULT_OK && data != null) {
+                      val i = Intent(this, CaptureService::class.java)
+                          .putExtra("code", resultCode)
+                          .putExtra("data", data)
+                      startForegroundService(i)
+                      moveTaskToBack(true)
+                  }
+              }
+          }
+          EOF
+
+          find . -path ./.git -prune -o -type f -print | sort
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
